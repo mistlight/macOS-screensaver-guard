@@ -184,4 +184,4 @@ battery forever. Use `sleep 0` to never sleep on battery.)
 
 ## License
 
-MIT — do whatever you want. Contributions / "this fixed it for me" reports welcome.
+GPLv3
