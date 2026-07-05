@@ -81,8 +81,23 @@ interrupts a screensaver that's actually on your screen:
 | 1 or more                   | **active** (idle < saver delay)  | **closed**      | **reap → clean respawn** |
 | 1 or more                   | idle past the saver delay        | —               | skip (a real saver may be on screen) |
 | 1 or more                   | active                           | **open**        | skip (you're previewing — don't blink it) |
+| 1 or more                   | idle time **unreadable**         | closed          | skip + `WARN` (fail safe — never risk killing a live saver) |
+| 1 or more                   | saver set to **Never** (idleTime=0) | closed       | **reap** (no host is ever legitimate outside Settings) |
 
-"Saver delay" = your configured `com.apple.screensaver idleTime` (defaults to 120s).
+"Saver delay" = your configured `com.apple.screensaver idleTime` (defaults to 120s
+when unreadable). All state reads are sanitized; anything garbled fails toward
+*skip*, never toward *kill*. Process counting and kills are scoped to your user, so
+the guard never touches another login session's saver.
+
+### Bonus health check: sandbox container staging
+
+There is a second, unrelated way the screensaver goes black that the reaper cannot
+see: if `~/Library/ContainerManager/Staging` is (or points at) a missing directory,
+the sandboxed `ScreenSaverEngine` quits ~20 ms after every launch — black screen,
+no host process, nothing to reap, only an `MCMErrorDomain CREATE_STAGING_DIRECTORY`
+line in the unified log. The guard now checks this path every tick; if it is a
+symlink whose target vanished it restores the target and logs `HEALED`, otherwise
+it logs a (throttled) `WARN` telling you what to fix.
 
 ---
 
