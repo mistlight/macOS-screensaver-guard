@@ -12,11 +12,15 @@ SCRATCH="${TMPDIR:-/tmp}/guard-test.$$.d"
 mkdir -p "$SCRATCH"
 fails=0
 
-run() { # name N IDLE SETTINGS expected [SAVER_IDLE]
-    name="$1"; N="$2"; IDLE="$3"; SET="$4"; EXP="$5"; SAVER="${6:-120}"
+# Keep every child's liveness/heartbeat writes inside the scratch dir so tests never
+# touch the real ~/Library/Application Support/ScreensaverGuard state.
+export GUARD_STATE_DIR="$SCRATCH/state"
+
+run() { # name N IDLE SETTINGS expected [SAVER_IDLE] [HOST_AGE]
+    name="$1"; N="$2"; IDLE="$3"; SET="$4"; EXP="$5"; SAVER="${6:-120}"; AGE="${7:-999}"
     GUARD_DRYRUN=1 GUARD_LOG="$TESTLOG" GUARD_STAGING="$SCRATCH/healthy-staging" \
         GUARD_TEST_N="$N" GUARD_TEST_IDLE="$IDLE" GUARD_TEST_SETTINGS="$SET" \
-        GUARD_TEST_SAVER_IDLE="$SAVER" \
+        GUARD_TEST_SAVER_IDLE="$SAVER" GUARD_TEST_HOST_AGE="$AGE" \
         sh "$SH"
     rc=$?
     got=$(tail -1 "$TESTLOG" | grep -oE 'healthy|would REAP|skip')
@@ -25,8 +29,8 @@ run() { # name N IDLE SETTINGS expected [SAVER_IDLE]
     else
         res="FAIL"; fails=$((fails+1))
     fi
-    printf '%-4s %-28s N=%-4s idle=%-4s set=%-4s saver=%-4s -> %-10s rc=%s (want %s)\n' \
-        "$res" "$name" "$N" "$IDLE" "$SET" "${SAVER:-dflt}" "$got" "$rc" "$EXP"
+    printf '%-4s %-28s N=%-4s idle=%-4s set=%-4s saver=%-4s age=%-4s -> %-10s rc=%s (want %s)\n' \
+        "$res" "$name" "$N" "$IDLE" "$SET" "${SAVER:-dflt}" "$AGE" "$got" "$rc" "$EXP"
 }
 
 # expect_log: run the guard with the given env against a fresh log, then assert
@@ -76,6 +80,39 @@ run "idle-unknown-never"    1 fail 0 "would REAP" 0  # saver=Never doesn't need 
 run "n-garbage"             x 5    0 "healthy"       # bad count -> treat as none
 run "settings-garbage"      1 5    x "skip"          # bad settings state -> assume open
 run "saver-garbage-dflt120" 1 119  0 "would REAP" x  # bad threshold -> default 120
+
+echo "--- hardening: host-age gate (don't race WallpaperAgent startup) ---"
+# A host older than the 10s startup window is stale -> reap; a fresh one is presumed
+# to be a legitimate in-progress activation -> skip so we never wedge WallpaperAgent.
+run "stale-host-reap"       1 5    0 "would REAP" 120 30
+run "fresh-host-skip"       1 5    0 "skip"       120 3
+run "boundary-age-10-reap"  1 5    0 "would REAP" 120 10
+run "boundary-age-9-skip"   1 5    0 "skip"       120 9
+run "age-unknown-skip"      1 5    0 "skip"       120 fail   # unreadable age fails safe
+run "age-empty-skip"        1 5    0 "skip"       120 " "
+run "never-fresh-host-skip" 1 999  0 "skip"       0   3      # even "Never", don't race startup
+run "never-stale-reap"      1 999  0 "would REAP" 0   30
+
+echo "--- observability: liveness + heartbeat ---"
+# Fresh state dir: first tick has no heartbeat file -> emits an "OK alive" line and
+# creates the liveness file. HEARTBEAT_SECS defaults large so the next tick is quiet.
+HBDIR="$SCRATCH/hbstate"
+: > "$TESTLOG"
+GUARD_DRYRUN=1 GUARD_LOG="$TESTLOG" GUARD_STAGING="$SCRATCH/healthy-staging" \
+    GUARD_STATE_DIR="$HBDIR" GUARD_TEST_N=0 GUARD_TEST_IDLE=5 GUARD_TEST_SETTINGS=0 sh "$SH"
+if grep -q "OK alive" "$TESTLOG"; then echo "PASS heartbeat-first-emits"; else echo "FAIL heartbeat-first-emits"; fails=$((fails+1)); fi
+if [ -f "$HBDIR/last-run" ]; then echo "PASS liveness-file-written"; else echo "FAIL liveness-file-written"; fails=$((fails+1)); fi
+# Second tick within the window: no new heartbeat line.
+: > "$TESTLOG"
+GUARD_DRYRUN=1 GUARD_LOG="$TESTLOG" GUARD_STAGING="$SCRATCH/healthy-staging" \
+    GUARD_STATE_DIR="$HBDIR" GUARD_HEARTBEAT_SECS=1800 \
+    GUARD_TEST_N=0 GUARD_TEST_IDLE=5 GUARD_TEST_SETTINGS=0 sh "$SH"
+if grep -q "OK alive" "$TESTLOG"; then echo "FAIL heartbeat-throttled (emitted again)"; fails=$((fails+1)); else echo "PASS heartbeat-throttled"; fi
+# HEARTBEAT_SECS=0 -> emit every tick even with an existing file.
+GUARD_DRYRUN=1 GUARD_LOG="$TESTLOG" GUARD_STAGING="$SCRATCH/healthy-staging" \
+    GUARD_STATE_DIR="$HBDIR" GUARD_HEARTBEAT_SECS=0 \
+    GUARD_TEST_N=0 GUARD_TEST_IDLE=5 GUARD_TEST_SETTINGS=0 sh "$SH"
+if grep -q "OK alive" "$TESTLOG"; then echo "PASS heartbeat-forced-0"; else echo "FAIL heartbeat-forced-0"; fails=$((fails+1)); fi
 
 echo "--- hardening: container staging health check ---"
 mkdir -p "$SCRATCH/containers"

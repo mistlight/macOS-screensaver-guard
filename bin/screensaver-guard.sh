@@ -35,18 +35,48 @@
 #     failures are swallowed, the log is rotated at 256 KB, repeated identical
 #     warnings are throttled, and the script always exits 0 so launchd stays happy.
 #
+# HARDENING (v4):
+#   - HOST-AGE GATE (self-inflicted-black-screen fix): legacyScreenSaver is a managed
+#     appex owned by WallpaperAgent. Killing a host WHILE WallpaperAgent is starting it
+#     throws WallpaperAgent into an unrecoverable loop -- "could not acquire startup
+#     assertion" / "plugin is already activating" / "killing plugin" -- which paints a
+#     black screen the guard itself caused. Confirmed on this machine 2026-07-07: the
+#     only assertion storm in 30h was the exact second a reap raced a just-spawned host;
+#     none of the day's 39 reaps of already-idle hosts stormed. So we now NEVER reap a
+#     host younger than MIN_HOST_AGE seconds (default 10) -- a fresh host is presumed to
+#     be a legitimate in-progress activation; if it is truly wedged it will still be
+#     there, and older than the gate, on the next tick. Age is read from `ps -o etime=`
+#     (macOS `ps` has no `etimes` keyword) and fails safe: unreadable age -> skip.
+#   - OBSERVABILITY: the guard used to log only when it reaped, so a healthy-but-idle
+#     guard looked identical to a dead one -- the recurring "is this thing even running?"
+#     confusion. It now touches a liveness file every run (mtime = last successful run,
+#     check with `stat -f %m`) and emits a throttled "OK alive" heartbeat line at most
+#     once per HEARTBEAT_SECS (default 1800s). Both writes are best-effort and can never
+#     break the guard.
+#   - WallpaperAgent bounce is now opt-out (GUARD_NO_WALLPAPER_KILL=1). It is kept on by
+#     default because bouncing WallpaperAgent is what RECOVERS a wedged host, but the
+#     age gate above means it now fires only on genuine stale-host reaps, not every tick.
+#
 # Safety: we only reap while the user is ACTIVE (idle below the saver threshold), which
 # means a real screensaver is NOT on screen, so reaping never interrupts a live saver.
-# We also skip while System Settings is open so we don't blink an in-progress preview.
+# We also skip while System Settings is open so we don't blink an in-progress preview,
+# and skip any host still inside its startup window (age gate) so we never race it.
 #
 # Testability: GUARD_TEST_N / GUARD_TEST_IDLE / GUARD_TEST_SETTINGS /
-# GUARD_TEST_SAVER_IDLE inject state, GUARD_STAGING overrides the health-check path,
-# and GUARD_DRYRUN=1 logs the decision without killing anything.
+# GUARD_TEST_SAVER_IDLE / GUARD_TEST_HOST_AGE inject state, GUARD_STAGING overrides the
+# health-check path, GUARD_STATE_DIR overrides the liveness/heartbeat dir,
+# GUARD_HEARTBEAT_SECS tunes the heartbeat cadence (0 = every run), and GUARD_DRYRUN=1
+# logs the decision without killing anything.
 set -u
 
 LOG="${GUARD_LOG:-$HOME/Library/Logs/screensaver-guard.log}"
 PROC="legacyScreenSaver"
 STAGING="${GUARD_STAGING:-$HOME/Library/ContainerManager/Staging}"
+STATE_DIR="${GUARD_STATE_DIR:-$HOME/Library/Application Support/ScreensaverGuard}"
+LIVENESS="$STATE_DIR/last-run"
+HEARTBEAT="$STATE_DIR/heartbeat"
+HEARTBEAT_SECS=$(printf '%s' "${GUARD_HEARTBEAT_SECS:-1800}" | tr -cd '0-9'); HEARTBEAT_SECS=${HEARTBEAT_SECS:-1800}
+MIN_HOST_AGE=$(printf '%s' "${GUARD_MIN_HOST_AGE:-10}" | tr -cd '0-9'); MIN_HOST_AGE=${MIN_HOST_AGE:-10}
 UID_NUM=$(id -u)
 USER_NAME=$(id -un)
 MAX_LOG_BYTES=262144
@@ -79,6 +109,46 @@ as_int() {
         ''|*[!0-9]*) printf '%s' "$2" ;;
         *)           printf '%s' "$1" ;;
     esac
+}
+
+# youngest_host_age PIDLIST — print the age in seconds of the *youngest* pid in the
+# space/comma list, or nothing if it cannot be read. macOS `ps` has no `etimes`
+# keyword, so we parse `etime` ([[dd-]hh:]mm:ss). We use the youngest host because
+# that is the one most likely to be mid-startup; if it is old enough to reap, every
+# host is.
+youngest_host_age() {
+    ps -o etime= -p "$1" 2>/dev/null | awk '
+        {
+            s=$1; d=0
+            n=split(s, a, "-"); if (n==2) { d=a[1]; s=a[2] }
+            m=split(s, b, ":")
+            if      (m==3) secs=b[1]*3600 + b[2]*60 + b[3]
+            else if (m==2) secs=b[1]*60 + b[2]
+            else           secs=b[1]
+            secs += d*86400
+            if (found==0 || secs<min) { min=secs; found=1 }
+        }
+        END { if (found) print min }'
+}
+
+# heartbeat: prove liveness even on quiet ticks. Touch a file every run (its mtime is
+# the last-run time) and emit one throttled "OK alive" line per HEARTBEAT_SECS. All
+# best-effort; never aborts the guard or changes its exit code.
+heartbeat() {
+    { mkdir -p "$STATE_DIR" && : > "$LIVENESS"; } 2>/dev/null || :
+    due=1
+    if [ -f "$HEARTBEAT" ]; then
+        hb_mtime=$(stat -f %m "$HEARTBEAT" 2>/dev/null) || hb_mtime=""
+        now=$(date +%s 2>/dev/null) || now=""
+        hb_mtime=$(as_int "$hb_mtime" ""); now=$(as_int "$now" "")
+        if [ -n "$hb_mtime" ] && [ -n "$now" ] && [ "$((now - hb_mtime))" -lt "$HEARTBEAT_SECS" ]; then
+            due=0
+        fi
+    fi
+    if [ "$due" -eq 1 ]; then
+        { mkdir -p "$STATE_DIR" && : > "$HEARTBEAT"; } 2>/dev/null || :
+        log "OK alive: $1"
+    fi
 }
 
 rotate_log
@@ -142,6 +212,9 @@ else
     settings_open=0
 fi
 
+# --- liveness / heartbeat (runs on every tick, healthy or not) -------------------
+heartbeat "n=$n idle=${idle_s:-unknown}s saver_idle=${saver_idle}s settings=$settings_open"
+
 # --- decide ----------------------------------------------------------------------
 # Healthy: ZERO hosts while active. The host is on-demand; it should not linger.
 if [ "$n" -le 0 ]; then
@@ -176,13 +249,47 @@ fi
 # saver_idle=0 means "start Never": no host is ever legitimately on screen outside
 # Settings, so any host is stale regardless of idle time -- fall through to reap.
 
+# --- host-age gate (do not race WallpaperAgent's startup) ------------------------
+# A host still inside its startup window is almost certainly a legitimate activation
+# in progress. Killing it there wedges WallpaperAgent ("could not acquire startup
+# assertion" / "already activating") and paints the very black screen we exist to
+# prevent. Never reap a host younger than MIN_HOST_AGE. Fail safe: if the age cannot
+# be read, skip (treat as "might be starting"), never kill blindly.
+if [ -n "${GUARD_TEST_HOST_AGE:-}" ]; then
+    host_age=$(as_int "$GUARD_TEST_HOST_AGE" "")
+else
+    pids=$(pgrep -U "$UID_NUM" -x "$PROC" 2>/dev/null | tr '\n' ' ')
+    pids=$(printf '%s' "$pids" | sed 's/[[:space:]]*$//')
+    if [ -n "$pids" ]; then
+        host_age=$(youngest_host_age "$(printf '%s' "$pids" | tr ' ' ',')")
+        host_age=$(as_int "$host_age" "")
+    else
+        host_age=""
+    fi
+fi
+if [ -z "$host_age" ]; then
+    log_once "WARN host age unreadable (ps etime); failing safe: not reaping (a host may be mid-startup)"
+    [ -n "${GUARD_DRYRUN:-}" ] && log "DRYRUN skip: n=$n host_age=unknown (fail-safe)"
+    exit 0
+fi
+if [ "$host_age" -lt "$MIN_HOST_AGE" ]; then
+    # Fresh host -> presumed legitimate in-progress activation. Leave it; if it is
+    # actually wedged it will still be here, and older, next tick.
+    [ -n "${GUARD_DRYRUN:-}" ] && log "DRYRUN skip: n=$n host_age=${host_age}s < min=${MIN_HOST_AGE}s (mid-startup, don't race)"
+    exit 0
+fi
+
 # Stale/wedged host. Reap it (own user's processes only).
 if [ -n "${GUARD_DRYRUN:-}" ]; then
-    log "DRYRUN would REAP: n=$n idle=${idle_s:-unknown}s saver_idle=${saver_idle}s, Settings closed"
+    log "DRYRUN would REAP: n=$n idle=${idle_s:-unknown}s host_age=${host_age}s saver_idle=${saver_idle}s, Settings closed"
     exit 0
 fi
 killall -u "$USER_NAME" legacyScreenSaver 2>/dev/null
-killall -u "$USER_NAME" WallpaperAgent 2>/dev/null
-killall -u "$USER_NAME" WallpaperImageExtension 2>/dev/null
-log "REAPED $n stale legacyScreenSaver host(s); idle=${idle_s:-unknown}s -> clean respawn on next activation"
+if [ -z "${GUARD_NO_WALLPAPER_KILL:-}" ]; then
+    # Bouncing WallpaperAgent is what RECOVERS a wedged host; the age gate above keeps
+    # this from firing on every tick. Opt out with GUARD_NO_WALLPAPER_KILL=1.
+    killall -u "$USER_NAME" WallpaperAgent 2>/dev/null
+    killall -u "$USER_NAME" WallpaperImageExtension 2>/dev/null
+fi
+log "REAPED $n stale legacyScreenSaver host(s); idle=${idle_s:-unknown}s host_age=${host_age}s -> clean respawn on next activation"
 exit 0

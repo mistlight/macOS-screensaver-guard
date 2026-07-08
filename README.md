@@ -81,13 +81,44 @@ interrupts a screensaver that's actually on your screen:
 | 1 or more                   | **active** (idle < saver delay)  | **closed**      | **reap → clean respawn** |
 | 1 or more                   | idle past the saver delay        | —               | skip (a real saver may be on screen) |
 | 1 or more                   | active                           | **open**        | skip (you're previewing — don't blink it) |
+| 1 or more                   | active, but host **< 10 s old**  | closed          | skip (host is mid-startup — don't race it, see below) |
 | 1 or more                   | idle time **unreadable**         | closed          | skip + `WARN` (fail safe — never risk killing a live saver) |
-| 1 or more                   | saver set to **Never** (idleTime=0) | closed       | **reap** (no host is ever legitimate outside Settings) |
+| 1 or more                   | host age **unreadable**          | closed          | skip + `WARN` (fail safe — a host may be mid-startup) |
+| 1 or more                   | saver set to **Never** (idleTime=0), host ≥ 10 s | closed | **reap** (no host is ever legitimate outside Settings) |
 
 "Saver delay" = your configured `com.apple.screensaver idleTime` (defaults to 120s
 when unreadable). All state reads are sanitized; anything garbled fails toward
 *skip*, never toward *kill*. Process counting and kills are scoped to your user, so
 the guard never touches another login session's saver.
+
+### Why the 10-second host-age gate matters (v4)
+
+`legacyScreenSaver` is a **managed app extension owned by `WallpaperAgent`**. If the
+guard kills a host *while WallpaperAgent is still starting it*, WallpaperAgent falls
+into an unrecoverable loop — `could not acquire startup assertion` /
+`plugin is already activating` / `killing plugin` — which paints the exact black
+screen the guard exists to prevent. (Confirmed on this machine: the only assertion
+storm in 30 h was the one second a reap raced a just-spawned host; dozens of reaps of
+already-idle hosts never stormed.)
+
+So the guard never reaps a host younger than `GUARD_MIN_HOST_AGE` seconds (default
+10). A freshly spawned host is presumed to be a legitimate activation in progress; if
+it is genuinely wedged it will still be there — and old enough — on the next tick.
+Host age is read from `ps -o etime=` (macOS `ps` has no `etimes` keyword) and fails
+safe: if it can't be read, the guard skips rather than reap.
+
+### Is it actually running? (liveness + heartbeat)
+
+The guard used to log **only when it reaped**, so a healthy-but-quiet guard looked
+identical to a dead one. It now proves liveness two ways:
+
+* it `touch`es `~/Library/Application Support/ScreensaverGuard/last-run` **every**
+  tick — its mtime is the last successful run (`stat -f %m …/last-run`);
+* it writes a throttled `OK alive: …` heartbeat line to the log at most once per
+  `GUARD_HEARTBEAT_SECS` (default 1800 s).
+
+The reaping and WallpaperAgent bounce are otherwise unchanged; bouncing WallpaperAgent
+on a reap is what *recovers* a wedged host (opt out with `GUARD_NO_WALLPAPER_KILL=1`).
 
 ### Bonus health check: sandbox container staging
 
@@ -125,7 +156,7 @@ No `sudo` required — it's a per-user agent.
 ## Test (no processes are killed)
 
 ```sh
-./tests/test-guard.sh    # 10 dry-run decision cases, prints PASS/FAIL
+./tests/test-guard.sh    # 32 dry-run decision / hardening cases, prints PASS/FAIL
 ```
 
 ---
@@ -138,6 +169,9 @@ tail -f ~/Library/Logs/screensaver-guard.log
 
 # Is the agent loaded and healthy?
 launchctl print gui/$(id -u)/com.mistlight.screensaver-guard | grep -E 'state|runs|last exit|interval'
+
+# Did it actually run recently? (mtime = last successful tick; should be < ~60s ago)
+stat -f '%Sm' ~/Library/Application\ Support/ScreensaverGuard/last-run
 
 # How many hosts are running right now? (0 is healthy while you're active)
 pgrep -x legacyScreenSaver | wc -l
