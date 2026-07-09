@@ -57,13 +57,27 @@
 #     default because bouncing WallpaperAgent is what RECOVERS a wedged host, but the
 #     age gate above means it now fires only on genuine stale-host reaps, not every tick.
 #
+# HARDENING (v5):
+#   - PEGGED-HOST OVERRIDE OF THE SETTINGS GATE (14h-black-screen fix): the Settings gate
+#     was an UNCONDITIONAL skip -- while System Settings was open, the guard never reaped,
+#     to avoid blinking a live preview. But the user leaves System Settings open for long
+#     stretches, and on 2026-07-09 a host wedged at ~100% CPU (spinning, painting black)
+#     while Settings sat open for ~20h; the guard skipped every tick for 14h and the
+#     screen stayed black. Fix: the Settings gate is no longer unconditional. A host
+#     pegged at/above GUARD_CPU_PEG% (default 80) is the wedge signature -- a real live
+#     preview renders light (~1%) -- so on a pegged host we override the Settings gate and
+#     fall through to the idle + age gates (which STILL protect a genuinely on-screen
+#     saver and a mid-startup host). Unreadable CPU fails safe = keep protecting the
+#     preview (skip). This never reaps a light-CPU preview, only a wedged host.
+#
 # Safety: we only reap while the user is ACTIVE (idle below the saver threshold), which
 # means a real screensaver is NOT on screen, so reaping never interrupts a live saver.
 # We also skip while System Settings is open so we don't blink an in-progress preview,
 # and skip any host still inside its startup window (age gate) so we never race it.
 #
 # Testability: GUARD_TEST_N / GUARD_TEST_IDLE / GUARD_TEST_SETTINGS /
-# GUARD_TEST_SAVER_IDLE / GUARD_TEST_HOST_AGE inject state, GUARD_STAGING overrides the
+# GUARD_TEST_SAVER_IDLE / GUARD_TEST_HOST_AGE / GUARD_TEST_HOST_CPU inject state,
+# GUARD_CPU_PEG tunes the pegged-host threshold, GUARD_STAGING overrides the
 # health-check path, GUARD_STATE_DIR overrides the liveness/heartbeat dir,
 # GUARD_HEARTBEAT_SECS tunes the heartbeat cadence (0 = every run), and GUARD_DRYRUN=1
 # logs the decision without killing anything.
@@ -77,6 +91,7 @@ LIVENESS="$STATE_DIR/last-run"
 HEARTBEAT="$STATE_DIR/heartbeat"
 HEARTBEAT_SECS=$(printf '%s' "${GUARD_HEARTBEAT_SECS:-1800}" | tr -cd '0-9'); HEARTBEAT_SECS=${HEARTBEAT_SECS:-1800}
 MIN_HOST_AGE=$(printf '%s' "${GUARD_MIN_HOST_AGE:-10}" | tr -cd '0-9'); MIN_HOST_AGE=${MIN_HOST_AGE:-10}
+CPU_PEG=$(printf '%s' "${GUARD_CPU_PEG:-80}" | tr -cd '0-9'); CPU_PEG=${CPU_PEG:-80}
 UID_NUM=$(id -u)
 USER_NAME=$(id -un)
 MAX_LOG_BYTES=262144
@@ -129,6 +144,16 @@ youngest_host_age() {
             if (found==0 || secs<min) { min=secs; found=1 }
         }
         END { if (found) print min }'
+}
+
+# hosts_max_cpu PIDLIST — print the highest %CPU (truncated to an integer) among the
+# comma/space-separated pids, or nothing if it cannot be read. A wedged host spins on a
+# core (~100% here); a healthy live preview renders light (~1%), so a pegged host is the
+# wedge signature even when it would otherwise look like a Settings live preview.
+hosts_max_cpu() {
+    ps -o %cpu= -p "$1" 2>/dev/null | awk '
+        { c=$1+0; if (found==0 || c>max) { max=c; found=1 } }
+        END { if (found) printf "%d", max }'
 }
 
 # heartbeat: prove liveness even on quiet ticks. Touch a file every run (its mtime is
@@ -212,6 +237,19 @@ else
     settings_open=0
 fi
 
+# host_cpu is the highest %CPU among this user's hosts, or "" when it cannot be read
+# (fail-safe: an unreadable CPU never triggers the pegged-host override below).
+if [ -n "${GUARD_TEST_HOST_CPU:-}" ]; then
+    host_cpu=$(as_int "$GUARD_TEST_HOST_CPU" "")
+else
+    cpu_pids=$(pgrep -U "$UID_NUM" -x "$PROC" 2>/dev/null | tr '\n' ',' | sed 's/,*$//')
+    if [ -n "$cpu_pids" ]; then
+        host_cpu=$(as_int "$(hosts_max_cpu "$cpu_pids")" "")
+    else
+        host_cpu=""
+    fi
+fi
+
 # --- liveness / heartbeat (runs on every tick, healthy or not) -------------------
 heartbeat "n=$n idle=${idle_s:-unknown}s saver_idle=${saver_idle}s settings=$settings_open"
 
@@ -224,9 +262,21 @@ fi
 
 # A host exists. Decide whether it is stale (reap) or legitimately on screen (skip).
 if [ "$settings_open" -ne 0 ]; then
-    # User is configuring; the host may be a live preview. Leave it alone.
-    [ -n "${GUARD_DRYRUN:-}" ] && log "DRYRUN skip: n=$n but System Settings open (live preview)"
-    exit 0
+    # User is configuring; the host may be a live preview, so normally leave it alone.
+    # EXCEPTION (v5): a host pegged at/above CPU_PEG% is the wedge signature -- it spins
+    # on a core and paints black, while a real live preview renders light. An open
+    # System Settings window must NOT permanently shield a wedged host: that is exactly
+    # how one host wedged at ~100% CPU for 14h (Settings left open the whole time) and
+    # the guard skipped every tick -> black screen. On a pegged host, fall through to the
+    # idle + age gates below (which STILL protect a genuinely on-screen saver and a
+    # mid-startup host); otherwise keep protecting the preview. Unreadable CPU fails safe
+    # to skip (preserves the old preview-protecting behavior).
+    if [ -n "$host_cpu" ] && [ "$host_cpu" -ge "$CPU_PEG" ]; then
+        log_once "WARN host pegged at ${host_cpu}% CPU with System Settings open -> treating as wedged, not a live preview (overriding Settings gate)"
+    else
+        [ -n "${GUARD_DRYRUN:-}" ] && log "DRYRUN skip: n=$n but System Settings open (live preview), host_cpu=${host_cpu:-unknown}%"
+        exit 0
+    fi
 fi
 
 if [ "$saver_idle" -ne 0 ]; then
@@ -291,5 +341,5 @@ if [ -z "${GUARD_NO_WALLPAPER_KILL:-}" ]; then
     killall -u "$USER_NAME" WallpaperAgent 2>/dev/null
     killall -u "$USER_NAME" WallpaperImageExtension 2>/dev/null
 fi
-log "REAPED $n stale legacyScreenSaver host(s); idle=${idle_s:-unknown}s host_age=${host_age}s -> clean respawn on next activation"
+log "REAPED $n stale legacyScreenSaver host(s); idle=${idle_s:-unknown}s host_age=${host_age}s host_cpu=${host_cpu:-unknown}% -> clean respawn on next activation"
 exit 0

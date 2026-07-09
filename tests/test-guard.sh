@@ -16,11 +16,11 @@ fails=0
 # touch the real ~/Library/Application Support/ScreensaverGuard state.
 export GUARD_STATE_DIR="$SCRATCH/state"
 
-run() { # name N IDLE SETTINGS expected [SAVER_IDLE] [HOST_AGE]
-    name="$1"; N="$2"; IDLE="$3"; SET="$4"; EXP="$5"; SAVER="${6:-120}"; AGE="${7:-999}"
+run() { # name N IDLE SETTINGS expected [SAVER_IDLE] [HOST_AGE] [HOST_CPU]
+    name="$1"; N="$2"; IDLE="$3"; SET="$4"; EXP="$5"; SAVER="${6:-120}"; AGE="${7:-999}"; CPU="${8:-0}"
     GUARD_DRYRUN=1 GUARD_LOG="$TESTLOG" GUARD_STAGING="$SCRATCH/healthy-staging" \
         GUARD_TEST_N="$N" GUARD_TEST_IDLE="$IDLE" GUARD_TEST_SETTINGS="$SET" \
-        GUARD_TEST_SAVER_IDLE="$SAVER" GUARD_TEST_HOST_AGE="$AGE" \
+        GUARD_TEST_SAVER_IDLE="$SAVER" GUARD_TEST_HOST_AGE="$AGE" GUARD_TEST_HOST_CPU="$CPU" \
         sh "$SH"
     rc=$?
     got=$(tail -1 "$TESTLOG" | grep -oE 'healthy|would REAP|skip')
@@ -92,6 +92,17 @@ run "age-unknown-skip"      1 5    0 "skip"       120 fail   # unreadable age fa
 run "age-empty-skip"        1 5    0 "skip"       120 " "
 run "never-fresh-host-skip" 1 999  0 "skip"       0   3      # even "Never", don't race startup
 run "never-stale-reap"      1 999  0 "would REAP" 0   30
+
+echo "--- hardening: pegged-CPU override of the Settings gate (wedged host, Settings open) ---"
+# A host pegged near a full core is the wedge signature -- it spins and paints black.
+# An open System Settings window must NOT permanently shield it (that let one host
+# wedge for 14h). Override the Settings gate on high CPU, but still honor idle + age.
+run "settings-pegged-reap"     1 5   1 "would REAP" 120 30 95   # wedged + user active -> reap despite Settings
+run "settings-pegged-fresh"    1 5   1 "skip"       120 3  95   # pegged but mid-startup -> age gate still guards
+run "settings-pegged-idle"     1 999 1 "skip"       120 30 95   # pegged but user idle -> real saver, don't kill
+run "settings-lightcpu-skip"   1 5   1 "skip"       120 30 2    # healthy live preview -> still protected
+run "settings-cpu-unknown"     1 5   1 "skip"       120 30 fail # unreadable CPU fails safe -> skip
+run "settings-cpu-boundary-80" 1 5   1 "would REAP" 120 30 80   # threshold is inclusive
 
 echo "--- observability: liveness + heartbeat ---"
 # Fresh state dir: first tick has no heartbeat file -> emits an "OK alive" line and
